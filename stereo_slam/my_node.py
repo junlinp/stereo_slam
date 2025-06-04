@@ -1,6 +1,8 @@
 import rclpy
 from rclpy.node import Node
+from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs.msg import Image, CameraInfo
+from std_msgs.msg import Header
 from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
 
@@ -15,6 +17,7 @@ from lightglue.utils import load_image, rbd
 from codetiming import Timer
 from scipy.spatial.transform import Rotation as R
 import einops
+from .landmark_tracker import LandmarkTracker
 
 logger = None
 
@@ -33,25 +36,58 @@ def get_embeddings(image):
         embeddings = outputs.last_hidden_state[:, 0, :]
     return embeddings.cpu().squeeze(0)
 
+def create_pointcloud2(points: np.ndarray, frame_id="map") -> PointCloud2:
+    """Creates a PointCloud2 message from a Nx3 numpy array."""
+    assert points.shape[1] == 3, "Points array must be Nx3"
+
+    header = Header()
+    header.stamp = rclpy.time.Time().to_msg()
+    header.frame_id = frame_id
+
+    fields = [
+        PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+        PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+        PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+    ]
+
+    # Flatten the point array to bytes
+    data = points.astype(np.float32).tobytes()
+
+    cloud_msg = PointCloud2(
+        header=header,
+        height=1,
+        width=points.shape[0],
+        fields=fields,
+        is_bigendian=False,
+        point_step=12,
+        row_step=12 * points.shape[0],
+        is_dense=True,
+        data=data
+    )
+    return cloud_msg
+
 # === Helper: Convert OpenCV to PIL ===
 def cv2_to_tensor(img):
     img = einops.rearrange(img, 'h w c -> c h w')
     return torch.tensor(img / 255.0, dtype=torch.float).unsqueeze(0).cuda()
 
+def extract_keypoints(image):
+    feats = extractor.extract(cv2_to_tensor(image))
+    return feats
 
-def match_keypoints(image0, image1):
-    # extract local features
-    with Timer(text="[superpoint] Elapsed time: {milliseconds:.0f} ms"):
-        feats0 = extractor.extract(cv2_to_tensor(image0))  # auto-resize the image, disable with resize=None
-        feats1 = extractor.extract(cv2_to_tensor(image1))
-        # match the features
-        with Timer(text="[lightglue] Elapsed time: {milliseconds:.0f} ms"):
-            matches01 = matcher({'image0': feats0, 'image1': feats1})
-        feats0, feats1, matches01 = [rbd(x) for x in [feats0, feats1, matches01]]  # remove batch dimension
-        matches = matches01['matches']  # indices with shape (K,2)
-        keypoints0 = feats0['keypoints'][matches[..., 0]]  # coordinates in image #0, shape (K,2)
-        keypoints1 = feats1['keypoints'][matches[..., 1]]  # coordinates in image #1, shape (K,2)
-        return keypoints0.cpu(), keypoints1.cpu()
+def match_keypoints(feats0, feats1):
+    # match the features
+    with Timer(text="[lightglue] Elapsed time: {milliseconds:.0f} ms"):
+        matches01 = matcher({'image0': feats0, 'image1': feats1})
+    #print(f"matches01: {matches01}")
+    #print(f"before feats0: {feats0['keypoints'].shape}")
+    #print(f"before feats1: {feats1['keypoints'].shape}")
+    feats0, feats1, matches01 = [rbd(x) for x in [feats0, feats1, matches01]]  # remove batch dimension
+    matches = matches01['matches']  # indices with shape (K,2)
+    #print(f"feats0: {feats0['keypoints'].shape}")
+    #print(f"feats1: {feats1['keypoints'].shape}")
+    #print(f"matches: {matches}")
+    return matches
 
 def compute_disparity_sgbm(left_img, right_img):
     matcher = cv2.StereoSGBM_create(
@@ -109,6 +145,7 @@ class MyNode(Node):
         self.pose_publisher = self.create_publisher(PoseStamped, 'estimated_pose', 10)
         self.simularity_publisher = self.create_publisher(Image, 'simularity', 10)
         self.match_publisher = self.create_publisher(Image, 'match', 10)
+        self.point_cloud_publisher = self.create_publisher(PointCloud2, 'point_cloud', 10)
 
         self.bridge = CvBridge()
         self.cam0_extrinsics = None
@@ -118,12 +155,17 @@ class MyNode(Node):
         self.cam1_intrinsics = None
         self.cam1_distortion = None
 
-        self.poses = []
+        self.poses = {}
         self.last_cam0_image = None
+        self.last_cam0_timestamp = None
         self.last_cam1_image = None
+
 
         self.cam0_embeddings = {}
         self.cam0_gray_images = {}
+
+
+        self.landmark_tracker = LandmarkTracker()
 
     def image_callback_cam0(self, msg):
         self.cam0_queue.append(msg)
@@ -184,38 +226,54 @@ class MyNode(Node):
         # TODO: Add your stereo processing logic here
         # You might want to convert the images to numpy arrays, process them,
         # and publish the results
-        timestamp = cam0_msg.header.stamp.sec * 1e9 + cam0_msg.header.stamp.nanosec
+        timestamp = int(cam0_msg.header.stamp.sec * 1000000000 + cam0_msg.header.stamp.nanosec)
 
         if self.cam0_intrinsics is None or self.cam0_distortion is None or self.cam1_intrinsics is None or self.cam1_distortion is None:
             self.get_logger().info("Camera info not available")
             return
+
         if self.last_cam0_image is None or self.last_cam1_image is None:
             self.last_cam0_image = self.bridge.imgmsg_to_cv2(cam0_msg, "bgr8")
             self.last_cam1_image = self.bridge.imgmsg_to_cv2(cam1_msg, "bgr8")
+            last_cam0_image_keypoints = extract_keypoints(self.last_cam0_image)
+            self.landmark_tracker.add_features(timestamp, last_cam0_image_keypoints)
+            self.last_cam0_timestamp = timestamp
             self.get_logger().info("No images available")
             return
 
         # get the image from Image message
         cam0_curr_image = self.bridge.imgmsg_to_cv2(cam0_msg, "bgr8")
         cam1_curr_image = self.bridge.imgmsg_to_cv2(cam1_msg, "bgr8")
-
         self.publish_simularity(timestamp, cam0_curr_image)
 
         # undistort the images
         cam0_curr_image = self.undistort_image(cam0_curr_image, self.cam0_intrinsics, self.cam0_distortion)
         cam1_curr_image = self.undistort_image(cam1_curr_image, self.cam1_intrinsics, self.cam1_distortion)
         rectified_cam0_image, rectified_cam1_image = stereo_rectify(cam0_curr_image, cam1_curr_image, self.cam0_intrinsics, self.cam1_intrinsics, self.cam0_distortion, self.cam1_distortion, self.cam0_extrinsics, self.cam1_extrinsics)
+
         disparity = compute_disparity_sgbm(rectified_cam0_image, rectified_cam1_image)
 
-        kpts_prev, kpts_curr = match_keypoints(self.last_cam0_image, cam0_curr_image)
+        # extract keypoints 
+        features_prev = self.landmark_tracker.get_features(self.last_cam0_timestamp)
+        features_curr = extract_keypoints(cam0_curr_image)
+
+        # add keypoints to landmark tracker
+        self.landmark_tracker.add_features(timestamp, features_curr)
+        # match keypoints
+        matches = match_keypoints(features_prev, features_curr)
+        kpts_prev = features_prev['keypoints'].squeeze(0)[matches[..., 0]]
+        kpts_curr = features_curr['keypoints'].squeeze(0)[matches[..., 1]]
+        self.landmark_tracker.add_matches(self.last_cam0_timestamp, timestamp, matches.cpu().numpy())
+        valid_landmark_ids = self.landmark_tracker.get_valid_landmark_ids()
 
         # draw kpts_prev and kpts_curr match
-        matches = [cv2.DMatch(_queryIdx=i, _trainIdx=i, _imgIdx=0, _distance=0) for i in range(kpts_prev.shape[0])]
+        cv_matches = [cv2.DMatch(_queryIdx=i, _trainIdx=i, _imgIdx=0, _distance=0) for i in range(kpts_prev.shape[0])]
         # convert kpts_prev and kpts_curr to cv2.KeyPoint 
-        print(f"type of kpts_prev[0, 0]: {type(kpts_prev[0, 0])}")
         cv_kpts_prev = [cv2.KeyPoint(x=kpts_prev[index, 0].item(), y=kpts_prev[index, 1].item(), size=20) for index in range(kpts_prev.shape[0])]
         cv_kpts_curr = [cv2.KeyPoint(x=kpts_curr[index, 0].item(), y=kpts_curr[index, 1].item(), size=20) for index in range(kpts_curr.shape[0])]
-        output_image = cv2.drawMatches(self.last_cam0_image, cv_kpts_prev, cam0_curr_image, cv_kpts_curr, matches, None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+
+        output_image = cv2.drawMatches(self.last_cam0_image, cv_kpts_prev, cam0_curr_image, cv_kpts_curr, cv_matches, None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+
         image_msg = self.bridge.cv2_to_imgmsg(output_image, "bgr8")
         image_msg.header.stamp.sec = int(timestamp // 1000000000)
         image_msg.header.stamp.nanosec = int(timestamp % 1000000000)
@@ -226,7 +284,10 @@ class MyNode(Node):
         cam0_cam1_translation = T_cam0_cam1[:3, 3]
         baseline = np.linalg.norm(cam0_cam1_translation)
         points_3d, points_2d = [], []
-        for pt_prev, pt_curr in zip(kpts_prev.numpy(), kpts_curr.numpy()):
+        points_index = []
+        points_index_of_prev = [matches[i, 0].item() for i in range(matches.shape[0])]
+
+        for pt_prev, pt_curr,index in zip(kpts_prev.cpu().numpy(), kpts_curr.cpu().numpy(), points_index_of_prev):
             u, v = int(pt_curr[0]), int(pt_curr[1])
             if 0 <= v < disparity.shape[0] and 0 <= u < disparity.shape[1]:
                 disp = disparity[v, u]
@@ -236,12 +297,17 @@ class MyNode(Node):
                     Y = (pt_curr[1] - self.cam0_intrinsics[1, 2]) * Z / self.cam0_intrinsics[1, 1]
                     points_3d.append([X, Y, Z])
                     points_2d.append(pt_prev)
+                    points_index.append(index)
+
+
+
         if len(points_3d) < 6:
             self.get_logger().info(f"Frame {timestamp}: not enough correspondences")
             return
         points_3d = np.array(points_3d, dtype=np.float32)
         points_2d = np.array(points_2d, dtype=np.float32)
 
+        # cam_prev_pose_in_cam_curr
         success, rvec, tvec, inliers = cv2.solvePnPRansac(points_3d, points_2d, self.cam0_intrinsics, None, 
                                                          iterationsCount=100, reprojectionError=8.0, 
                                                          confidence=0.99, flags=cv2.SOLVEPNP_ITERATIVE)
@@ -254,24 +320,34 @@ class MyNode(Node):
         T[:3, :3] = rotation_matrix
         T[:3, 3] = tvec.ravel()
 
+
         if len(self.poses) == 0:
-            self.poses.append(T)
-        else:
-            self.poses.append(self.poses[-1] @ np.linalg.inv(T))
+            self.poses[self.last_cam0_timestamp] = np.eye(4)
+
+        self.poses[timestamp] = self.poses[self.last_cam0_timestamp] @ np.linalg.inv(T)
+
+        for index, point_3d in zip(points_index, points_3d):
+            point_in_cam_curr =  np.array(point_3d)
+            cam_curr_in_world = self.poses[timestamp]
+            point_in_world = cam_curr_in_world[:3, :3] @ point_in_cam_curr + cam_curr_in_world[:3, 3]
+            self.landmark_tracker.assigned_points_3d_if_not_values(self.last_cam0_timestamp, index, np.array(point_in_world))
 
         self.last_cam0_image = cam0_curr_image
         self.last_cam1_image = cam1_curr_image
+        assert timestamp > self.last_cam0_timestamp
+        self.last_cam0_timestamp = timestamp
 
         pose_msg = PoseStamped()
         pose_msg.header.stamp = cam0_msg.header.stamp
-        pose_msg.header.frame_id = "cam0_link0"
-        last_pose = self.poses[-1]
+        pose_msg.header.frame_id = "world"
 
-        last_body_pose = last_pose @ np.linalg.inv(self.cam0_extrinsics)
-        pose_msg.pose.position.x = last_body_pose[0, 3]
-        pose_msg.pose.position.y = last_body_pose[1, 3]
-        pose_msg.pose.position.z = last_body_pose[2, 3]
-        rotation = R.from_matrix(last_body_pose[:3, :3])
+        current_pose = self.poses[timestamp]
+        current_body_pose = current_pose @ np.linalg.inv(self.cam0_extrinsics)
+
+        pose_msg.pose.position.x = current_body_pose[0, 3]
+        pose_msg.pose.position.y = current_body_pose[1, 3]
+        pose_msg.pose.position.z = current_body_pose[2, 3]
+        rotation = R.from_matrix(current_body_pose[:3, :3])
         rotation_quat = rotation.as_quat()
         pose_msg.pose.orientation.x = rotation_quat[0]
         pose_msg.pose.orientation.y = rotation_quat[1]
@@ -280,11 +356,15 @@ class MyNode(Node):
         self.get_logger().info(f"Estimated pose: {pose_msg.pose}")
         self.pose_publisher.publish(pose_msg)
 
+        point_3d_in_world =  self.landmark_tracker.get_landmark_positions()
+        # publish point_3d_in_world
+        msg = create_pointcloud2(point_3d_in_world, frame_id="world")
+        self.point_cloud_publisher.publish(msg)
 
     def undistort_image(self, image, intrinsics, distortion):
-        self.get_logger().info(f"Undistorting image image shape: {image.shape}")
-        self.get_logger().info(f"Undistorting image intrinsics shape: {intrinsics.shape}")
-        self.get_logger().info(f"Undistorting image distortion shape: {distortion.shape}")
+        #self.get_logger().info(f"Undistorting image image shape: {image.shape}")
+        #self.get_logger().info(f"Undistorting image intrinsics shape: {intrinsics.shape}")
+        #self.get_logger().info(f"Undistorting image distortion shape: {distortion.shape}")
         # Convert image to numpy array
         #image_array = #np.frombuffer(image.data, dtype=np.uint8).reshape(image.height, image.width, -1)
         image_array = image
@@ -297,13 +377,13 @@ class MyNode(Node):
         self.cam0_info = msg
         self.cam0_intrinsics = np.array(msg.k).reshape(3, 3)
         self.cam0_distortion = np.array(msg.d)
-        self.get_logger().info(f"Cam0 intrinsics: {self.cam0_intrinsics}")
+        # self.get_logger().info(f"Cam0 intrinsics: {self.cam0_intrinsics}")
 
     def camera_info_callback_cam1(self, msg):
         self.cam1_info = msg
         self.cam1_intrinsics = np.array(msg.k).reshape(3, 3)
         self.cam1_distortion = np.array(msg.d)
-        self.get_logger().info(f"Cam1 intrinsics: {self.cam1_intrinsics}")
+        # self.get_logger().info(f"Cam1 intrinsics: {self.cam1_intrinsics}")
 
     def publish_simularity(self,  timestamp, cam0_image):
         cam0_embedding = get_embeddings(cam0_image)

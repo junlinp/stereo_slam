@@ -1,0 +1,156 @@
+import numpy as np
+
+class LandmarkTracker:
+    def __init__(self):
+        self.landmark_ids = {}
+        self.landmark_descriptors = []
+        self.landmark_timestamps = []
+
+        self.feature_buffer = {}
+
+        self.feature_to_landmark_id = {}
+        self.landmark_id_to_feature_index = {}
+        self.landmark_id_to_position = {}
+
+    def add_features(self, timestamp: int, feature:dict) -> bool:
+        if timestamp in self.feature_buffer:
+            return False
+        self.feature_buffer[timestamp] = feature
+        return True
+
+    def get_features(self, timestamp: int):
+        return self.feature_buffer[timestamp]
+
+    def get_keypoint_2d(self, timestamp: int, feature_index: int):
+        return self.feature_buffer[timestamp]['keypoints'][feature_index]
+
+    def get_feature(self, timestamp: int):
+        return self.feature_buffer[timestamp]
+
+    def add_matches(self, timestamp0: int, timestamp1: int, matches: np.ndarray) -> bool:
+        match_size = matches.shape[0]
+        for i in range(match_size):
+            feature_index0 = matches[i, 0]
+            feature_index1 = matches[i, 1]
+            
+            landmark_id0 = self.try_get_landmark_id(timestamp0, feature_index0)
+            landmark_id1 = self.try_get_landmark_id(timestamp1, feature_index1)
+
+            self.merge_landmarks_if_not_overlap(timestamp0, feature_index0, landmark_id0, timestamp1, feature_index1, landmark_id1)
+
+
+    # get landmark id from feature index and timestamp, create new landmark id if not exists
+    def try_get_landmark_id(self, timestamp: int, feature_index: int):
+        if timestamp in self.feature_to_landmark_id and feature_index in self.feature_to_landmark_id[timestamp]:
+            return self.feature_to_landmark_id[timestamp][feature_index]
+
+        landmark_id = len(self.landmark_ids)
+
+        if timestamp not in self.feature_to_landmark_id:
+            self.feature_to_landmark_id[timestamp] = {}
+        if feature_index not in self.feature_to_landmark_id[timestamp]:
+            self.feature_to_landmark_id[timestamp][feature_index] = landmark_id
+
+        if landmark_id not in self.landmark_id_to_feature_index:
+            self.landmark_id_to_feature_index[landmark_id] = {}
+
+        if timestamp not in self.landmark_id_to_feature_index[landmark_id]:
+            self.landmark_id_to_feature_index[landmark_id][timestamp] = feature_index
+        self.landmark_ids[landmark_id] = True
+        return landmark_id
+    
+    def merge_landmarks_if_not_overlap(self, timestamp0: int, feature_index0: int, landmark_id0: int, timestamp1: int, feature_index1: int, landmark_id1: int):
+        if landmark_id0 == landmark_id1:
+            return
+        
+        if landmark_id0 is None or landmark_id1 is None:
+            return
+        
+        landmark_id0_timestamps = self.landmark_id_to_feature_index[landmark_id0]
+        landmark_id1_timestamps = self.landmark_id_to_feature_index[landmark_id1]
+        # overlap we don't merge
+        if landmark_id0_timestamps.keys() & landmark_id1_timestamps.keys():
+            return
+
+        if landmark_id0 > landmark_id1:
+            for timestamp, feature_index in landmark_id1_timestamps.items():
+                self.feature_to_landmark_id[timestamp][feature_index] = landmark_id0
+                self.landmark_id_to_feature_index[landmark_id0][timestamp] = feature_index
+                self.landmark_ids[landmark_id1] = False
+                if landmark_id1 in self.landmark_id_to_position:
+                    if landmark_id0 not in self.landmark_id_to_position:
+                        self.landmark_id_to_position[landmark_id0] = self.landmark_id_to_position[landmark_id1]
+                    del self.landmark_id_to_position[landmark_id1]
+            del self.landmark_id_to_feature_index[landmark_id1]
+        else:
+            for timestamp, feature_index in landmark_id0_timestamps.items():
+                self.feature_to_landmark_id[timestamp][feature_index] = landmark_id1
+                self.landmark_id_to_feature_index[landmark_id1][timestamp] = feature_index
+                self.landmark_ids[landmark_id0] = False
+                if landmark_id0 in self.landmark_id_to_position:
+                    if landmark_id1 not in self.landmark_id_to_position:
+                        self.landmark_id_to_position[landmark_id1] = self.landmark_id_to_position[landmark_id0]
+                    del self.landmark_id_to_position[landmark_id0]
+            del self.landmark_id_to_feature_index[landmark_id0]
+
+    def get_valid_landmark_ids(self) -> list:
+        return [landmark_id for landmark_id, is_valid in self.landmark_ids.items() if is_valid]
+
+    def assigned_points_3d_if_not_values(self, timestamp: int, feature_index: int, point_3d: np.ndarray) -> bool:
+        if timestamp not in self.feature_to_landmark_id:
+            print(f"timestamp {timestamp} not in feature_to_landmark_id")
+            return False
+        if feature_index not in self.feature_to_landmark_id[timestamp]:
+            print(f"feature_index {feature_index} not in feature_to_landmark_id[{timestamp}]")
+            #print(f"feature_to_landmark_id[{timestamp}]: {self.feature_to_landmark_id[timestamp]}")
+            return False
+        landmark_id = self.feature_to_landmark_id[timestamp][feature_index]
+        if landmark_id not in self.landmark_id_to_position:
+            self.landmark_id_to_position[landmark_id] = point_3d
+            return True
+        return True
+
+    def get_landmark_positions(self) -> np.ndarray:
+        return np.array([self.landmark_id_to_position[landmark_id] for landmark_id in self.landmark_id_to_position])
+    
+import unittest 
+class TestMathFunctions(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.landmark_tracker = LandmarkTracker()
+
+    def test_add_matches(self) -> None:
+        self.landmark_tracker.add_matches(0, 1, np.array([[0, 0]]))
+        self.landmark_tracker.assigned_points_3d_if_not_values(0, 0, np.array([1, 2, 3]))
+
+        self.assertEqual(self.landmark_tracker.landmark_ids[0], False)
+        self.assertEqual(self.landmark_tracker.landmark_ids[1], True)
+        self.assertEqual(len(self.landmark_tracker.landmark_id_to_feature_index[1]), 2)
+        self.landmark_tracker.add_matches(0, 2, np.array([[0, 1]]))
+        self.assertEqual(self.landmark_tracker.landmark_ids[1], False)
+        self.assertEqual(self.landmark_tracker.landmark_ids[2], True)
+        self.assertEqual(len(self.landmark_tracker.landmark_id_to_feature_index[2]), 3)
+        self.landmark_tracker.add_matches(1, 2, np.array([[1, 1]]))
+        self.assertEqual(self.landmark_tracker.landmark_ids[2], True)
+        self.assertEqual(self.landmark_tracker.landmark_ids[3], True)
+        self.assertEqual(len(self.landmark_tracker.landmark_id_to_feature_index[2]), 3)
+
+        self.assertEqual(self.landmark_tracker.landmark_id_to_position[2][0], 1)
+        self.assertEqual(self.landmark_tracker.landmark_id_to_position[2][1], 2)
+        self.assertEqual(self.landmark_tracker.landmark_id_to_position[2][2], 3)
+
+    def test_add_matches(self) -> None:
+        self.landmark_tracker.add_matches(0, 1, np.array([[0, 1], [1, 2], [2, 3]]))
+        self.assertEqual(len(self.landmark_tracker.feature_to_landmark_id), 2)
+        self.assertEqual(len(self.landmark_tracker.feature_to_landmark_id[0]), 3)
+
+        self.assertEqual(self.landmark_tracker.feature_to_landmark_id[0][0], 1)
+        self.assertEqual(self.landmark_tracker.feature_to_landmark_id[0][1], 3)
+        self.assertEqual(self.landmark_tracker.feature_to_landmark_id[0][2], 5)
+
+        self.landmark_tracker.assigned_points_3d_if_not_values(0, 0, np.array([0, 1, 2]))
+        self.landmark_tracker.assigned_points_3d_if_not_values(0, 1, np.array([1, 2, 3]))
+        self.landmark_tracker.assigned_points_3d_if_not_values(0, 2, np.array([2, 3, 4]))
+
+if __name__ == '__main__':
+    unittest.main()
