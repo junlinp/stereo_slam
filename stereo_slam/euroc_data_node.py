@@ -38,7 +38,8 @@ class EurocDataNode(Node):
         self.aligned_estimated_pose_pub = self.create_publisher(PoseStamped, 'aligned_estimated_pose', 10)
         
         # create timer for publishing at 20Hz (50ms period)
-        self.timer = self.create_timer(0.05, self.publish_data)
+        #self.timer = self.create_timer(0.05, self.publish_data)
+        self.timer = self.create_timer(1, self.publish_data)
         
         # initialize image index
         self.current_idx = 0

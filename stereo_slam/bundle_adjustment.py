@@ -1,33 +1,49 @@
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
 from pytorch3d.transforms import quaternion_to_matrix, matrix_to_quaternion
 import math
 
+
 class BundleAdjustment:
-    def __init__(self, camera_intrinsics: np.ndarray):
+    def __init__(self):
+        self.camera_intrinsics = None
+
+
+    def update_camera_intrinsics(self, camera_intrinsics: np.ndarray):
         self.camera_intrinsics = torch.tensor(camera_intrinsics, dtype=torch.float64)
         self.camera_intrinsics.requires_grad = False
 
     def optimize(self, camera_poses: np.ndarray, landmark_positions: np.ndarray, projection_relations: list):
+        if self.camera_intrinsics is None:
+            raise ValueError("camera_intrinsics is not set")
         # set the first pose to be constant
-        camera_poses = torch.tensor(camera_poses, dtype=torch.float64)
-        const_camera_pose = torch.tensor(camera_poses[0, :], dtype=torch.float64, requires_grad=False)
+        const_camera_pose = torch.tensor(camera_poses[0, :], dtype=torch.float64, requires_grad=False).unsqueeze(0)
         optimizable_camera_poses = torch.tensor(camera_poses[1:, :], dtype=torch.float64, requires_grad=True)
+        print(f"const_camera_pose: {const_camera_pose.shape}, optimizable_camera_poses: {optimizable_camera_poses.shape}")
 
-        torch_camera_poses = torch.stack([const_camera_pose, optimizable_camera_poses])
+        torch_camera_poses = torch.cat([const_camera_pose, optimizable_camera_poses], dim=0)
+        print(f"torch_camera_poses: {torch_camera_poses.shape}")
 
         torch_landmark_positions = torch.tensor(landmark_positions, dtype=torch.float64, requires_grad=True)
 
-        projection_relations = torch.tensor(projection_relations, dtype=torch.float64)
-
         optimizer = torch.optim.Adam([optimizable_camera_poses, torch_landmark_positions], lr=0.001)
 
+        data_loader = DataLoader(projection_relations, batch_size=16, shuffle=True)
+        iterator = iter(data_loader)
         final_loss = 0
-        for i in range(100):
+        for i in range(10):
+            # check if the iterator is empty
+            try:
+                batch_projection_relations = next(iterator)
+            except StopIteration:
+                iterator = iter(data_loader)
+                batch_projection_relations = next(iterator)
+            #print(f"batch_projection_relations: {(batch_projection_relations)}")
             optimizer.zero_grad()
-            losses = self.forward(torch_camera_poses, torch_landmark_positions, projection_relations)
+            losses = self.forward(torch_camera_poses, torch_landmark_positions, batch_projection_relations)
             losses.backward()
             optimizer.step()
             final_loss += losses.item()
@@ -41,13 +57,15 @@ class BundleAdjustment:
         # landmark_positions: (N, 3)
         # projection_relations: list of (camera_id, landmark_id, projection_2d)
         loss = 0
-        for camera_id, landmark_id, projection_2d in projection_relations:
+        camera_ids, landmark_ids, projection_2ds = projection_relations
+
+        for camera_id, landmark_id, projection_2d in zip(camera_ids, landmark_ids, projection_2ds):
             camera_pose = camera_poses[camera_id, :]
             landmark_position = landmark_positions[landmark_id]
             projection_2d_const = torch.tensor(projection_2d, dtype=torch.float64, requires_grad=False)
             projection_2d_pred = self.project(camera_pose, landmark_position)
+            # print(f"projection_2d_const: {projection_2d_const}, projection_2d_pred: {projection_2d_pred}")
             loss += torch.sum(projection_2d_const - projection_2d_pred) ** 2
-
         return loss / len(projection_relations)
 
 
@@ -72,6 +90,7 @@ class BundleAdjustment:
         # quaternion: (4)
         # rotation_matrix: (3, 3)
         quaternion = quaternion / quaternion.norm()
+        # print(f"quaternion: {quaternion}")
         return quaternion_to_matrix(quaternion).to(torch.float64)
 
 

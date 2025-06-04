@@ -18,6 +18,8 @@ from codetiming import Timer
 from scipy.spatial.transform import Rotation as R
 import einops
 from .landmark_tracker import LandmarkTracker
+from .bundle_adjustment import BundleAdjustment
+from .rigid3d import Rigid3d
 
 logger = None
 
@@ -110,9 +112,9 @@ def compute_disparity_sgbm(left_img, right_img):
 
 def stereo_rectify(cam0_image, cam1_image, cam0_intrinsics, cam1_intrinsics, cam0_distortion, cam1_distortion,cam0_extrinsics, cam1_extrinsics):
     # extrinsics from cam0 to cam1
-    T_cam0_cam1 = np.linalg.inv(cam1_extrinsics) @ cam0_extrinsics
-    R = T_cam0_cam1[:3, :3]
-    T = T_cam0_cam1[:3, 3]
+    T_cam0_cam1 = cam0_extrinsics * cam1_extrinsics.inverse()
+    R = T_cam0_cam1.to_matrix33()
+    T = T_cam0_cam1.translation_vector()
 
     image_size = (cam0_image.shape[1], cam0_image.shape[0])
     R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(cameraMatrix1=cam0_intrinsics, distCoeffs1=cam0_distortion, cameraMatrix2=cam1_intrinsics, distCoeffs2=cam1_distortion, imageSize=image_size, R=R, T=T)
@@ -166,6 +168,8 @@ class MyNode(Node):
 
 
         self.landmark_tracker = LandmarkTracker()
+        self.bundle_adjustment = BundleAdjustment()
+
 
     def image_callback_cam0(self, msg):
         self.cam0_queue.append(msg)
@@ -179,18 +183,12 @@ class MyNode(Node):
 
         rotation = R.from_quat([msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w])
         translation = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
-        pose = np.eye(4)
-        pose[:3, :3] = rotation.as_matrix()
-        pose[:3, 3] = translation
-        self.cam0_extrinsics = pose
+        self.cam0_extrinsics = Rigid3d.from_vector(np.concatenate([translation, rotation.as_quat()]))
 
     def extrinsics_callback_cam1(self, msg):
         rotation = R.from_quat([msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w])
         translation = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
-        pose = np.eye(4)
-        pose[:3, :3] = rotation.as_matrix()
-        pose[:3, 3] = translation
-        self.cam1_extrinsics = pose
+        self.cam1_extrinsics = Rigid3d.from_vector(np.concatenate([translation, rotation.as_quat()]))
         
     def try_match_images(self):
         if not self.cam0_queue or not self.cam1_queue:
@@ -279,9 +277,9 @@ class MyNode(Node):
         image_msg.header.stamp.nanosec = int(timestamp % 1000000000)
         self.match_publisher.publish(image_msg)
 
-        T_cam0_cam1 = np.linalg.inv(self.cam1_extrinsics) @ self.cam0_extrinsics
-        cam0_cam1_rotation = T_cam0_cam1[:3, :3]
-        cam0_cam1_translation = T_cam0_cam1[:3, 3]
+        T_cam0_cam1 = self.cam0_extrinsics * self.cam1_extrinsics.inverse()
+        cam0_cam1_rotation = T_cam0_cam1.to_matrix33()
+        cam0_cam1_translation = T_cam0_cam1.translation_vector()
         baseline = np.linalg.norm(cam0_cam1_translation)
         points_3d, points_2d = [], []
         points_index = []
@@ -316,20 +314,19 @@ class MyNode(Node):
             self.get_logger().info(f"Frame {timestamp}: PnP failed")
             return
         rotation_matrix, _ = cv2.Rodrigues(rvec)
-        T = np.eye(4)
-        T[:3, :3] = rotation_matrix
-        T[:3, 3] = tvec.ravel()
+
+        rotation_quaternion = R.from_matrix(rotation_matrix).as_quat()
+        translation = tvec.ravel()
 
 
         if len(self.poses) == 0:
-            self.poses[self.last_cam0_timestamp] = np.eye(4)
-
-        self.poses[timestamp] = self.poses[self.last_cam0_timestamp] @ np.linalg.inv(T)
+            self.poses[self.last_cam0_timestamp] = Rigid3d.identity()
+        self.poses[timestamp] = self.poses[self.last_cam0_timestamp] * Rigid3d.from_vector(np.concatenate([translation, rotation_quaternion])).inverse()
 
         for index, point_3d in zip(points_index, points_3d):
             point_in_cam_curr =  np.array(point_3d)
             cam_curr_in_world = self.poses[timestamp]
-            point_in_world = cam_curr_in_world[:3, :3] @ point_in_cam_curr + cam_curr_in_world[:3, 3]
+            point_in_world = cam_curr_in_world.to_matrix33() @ point_in_cam_curr + cam_curr_in_world.translation_vector()
             self.landmark_tracker.assigned_points_3d_if_not_values(self.last_cam0_timestamp, index, np.array(point_in_world))
 
         self.last_cam0_image = cam0_curr_image
@@ -342,23 +339,42 @@ class MyNode(Node):
         pose_msg.header.frame_id = "world"
 
         current_pose = self.poses[timestamp]
-        current_body_pose = current_pose @ np.linalg.inv(self.cam0_extrinsics)
-
-        pose_msg.pose.position.x = current_body_pose[0, 3]
-        pose_msg.pose.position.y = current_body_pose[1, 3]
-        pose_msg.pose.position.z = current_body_pose[2, 3]
-        rotation = R.from_matrix(current_body_pose[:3, :3])
-        rotation_quat = rotation.as_quat()
-        pose_msg.pose.orientation.x = rotation_quat[0]
-        pose_msg.pose.orientation.y = rotation_quat[1]
-        pose_msg.pose.orientation.z = rotation_quat[2]
-        pose_msg.pose.orientation.w = rotation_quat[3]
-        self.get_logger().info(f"Estimated pose: {pose_msg.pose}")
+        current_body_pose = current_pose * self.cam0_extrinsics.inverse()
+        current_body_pose_vector = current_body_pose.to_vector()
+        pose_msg.pose.position.x = current_body_pose_vector[0]
+        pose_msg.pose.position.y = current_body_pose_vector[1]
+        pose_msg.pose.position.z = current_body_pose_vector[2]
+        pose_msg.pose.orientation.x = current_body_pose_vector[3]
+        pose_msg.pose.orientation.y = current_body_pose_vector[4]
+        pose_msg.pose.orientation.z = current_body_pose_vector[5]
+        pose_msg.pose.orientation.w = current_body_pose_vector[6]
         self.pose_publisher.publish(pose_msg)
 
-        point_3d_in_world =  self.landmark_tracker.get_landmark_positions()
+
+        with Timer(text="[bundle_adjustment] Elapsed time: {milliseconds:.0f} ms"):
+            timestamp_to_camera_index = {}
+            camera_poses = []
+
+            print(f"self.poses: {len(self.poses)}")
+            for index, timestamp in enumerate(self.poses.keys()):
+                timestamp_to_camera_index[timestamp] = index
+                camera_poses.append(self.poses[timestamp].to_vector())
+            camera_poses = np.array(camera_poses, dtype=np.float32)
+            projection_relations, point_3d_in_world, landmark_id_to_index = self.landmark_tracker.get_projection_relations_and_landmark_position(timestamp_to_camera_index)
+
+            optimized_camera_poses, optimized_point_3d_in_world = self.bundle_adjustment.optimize(camera_poses, point_3d_in_world, projection_relations)
+
+            # update optimized_camera_poses to self.poses
+            for index, timestamp in enumerate(self.poses.keys()):
+                self.poses[timestamp] = Rigid3d.from_vector(optimized_camera_poses[index])
+
+            # update optimized_point_3d_in_world to self.landmark_tracker
+            self.landmark_tracker.update_landmark_positions(optimized_point_3d_in_world, landmark_id_to_index)
+
+        updated_point_3d_in_world =  self.landmark_tracker.get_landmark_positions()
+
         # publish point_3d_in_world
-        msg = create_pointcloud2(point_3d_in_world, frame_id="world")
+        msg = create_pointcloud2(updated_point_3d_in_world, frame_id="world")
         self.point_cloud_publisher.publish(msg)
 
     def undistort_image(self, image, intrinsics, distortion):
@@ -378,6 +394,7 @@ class MyNode(Node):
         self.cam0_intrinsics = np.array(msg.k).reshape(3, 3)
         self.cam0_distortion = np.array(msg.d)
         # self.get_logger().info(f"Cam0 intrinsics: {self.cam0_intrinsics}")
+        self.bundle_adjustment.update_camera_intrinsics(self.cam0_intrinsics)
 
     def camera_info_callback_cam1(self, msg):
         self.cam1_info = msg

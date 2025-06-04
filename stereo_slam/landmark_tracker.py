@@ -15,7 +15,9 @@ class LandmarkTracker:
     def add_features(self, timestamp: int, feature:dict) -> bool:
         if timestamp in self.feature_buffer:
             return False
+
         self.feature_buffer[timestamp] = feature
+        # print(f"feature_buffer: {self.feature_buffer}")
         return True
 
     def get_features(self, timestamp: int):
@@ -113,6 +115,34 @@ class LandmarkTracker:
     def get_landmark_positions(self) -> np.ndarray:
         return np.array([self.landmark_id_to_position[landmark_id] for landmark_id in self.landmark_id_to_position])
     
+    def get_projection_relations_and_landmark_position(self, timestamp_to_camera_index: dict) -> list:
+        landmark_id_to_index = {}
+
+        for index, landmark_id in enumerate(self.landmark_id_to_position.keys()):
+            landmark_id_to_index[landmark_id] = index
+
+        landmark_positions = np.zeros((len(landmark_id_to_index), 3))
+        projection_relations = []
+        for landmark_id in landmark_id_to_index.keys():
+            position_index = landmark_id_to_index[landmark_id]
+            landmark_positions[position_index, :] = self.landmark_id_to_position[landmark_id]
+
+            landmark_index_to_timestamp = self.landmark_id_to_feature_index[landmark_id]
+
+            for timestamp, feature_index in landmark_index_to_timestamp.items():
+                if timestamp not in timestamp_to_camera_index:
+                    continue
+                camera_index = timestamp_to_camera_index[timestamp]
+                #print(f"timestamp: {timestamp}, camera_index: {camera_index}, feature_index: {feature_index}")
+                #print(f"feature_buffer[{timestamp}]: {self.feature_buffer[timestamp]['keypoints'].shape}")
+                projection_relations.append((camera_index, landmark_id_to_index[landmark_id], self.feature_buffer[timestamp]['keypoints'][0,feature_index, :].cpu().numpy()))
+
+        return projection_relations, landmark_positions, landmark_id_to_index
+
+    def update_landmark_positions(self, landmark_positions: np.ndarray, landmark_id_to_index: dict):
+        for landmark_id, index in landmark_id_to_index.items():
+            self.landmark_id_to_position[landmark_id] = landmark_positions[index]
+
 import unittest 
 class TestMathFunctions(unittest.TestCase):
 
@@ -120,6 +150,7 @@ class TestMathFunctions(unittest.TestCase):
         self.landmark_tracker = LandmarkTracker()
 
     def test_add_matches(self) -> None:
+
         self.landmark_tracker.add_matches(0, 1, np.array([[0, 0]]))
         self.landmark_tracker.assigned_points_3d_if_not_values(0, 0, np.array([1, 2, 3]))
 
@@ -140,6 +171,11 @@ class TestMathFunctions(unittest.TestCase):
         self.assertEqual(self.landmark_tracker.landmark_id_to_position[2][2], 3)
 
     def test_add_matches(self) -> None:
+
+        self.assertTrue(self.landmark_tracker.add_features(0, {'keypoints': np.array([[1, 2], [3, 4], [5, 6], [7, 8]])}))
+        self.assertTrue(self.landmark_tracker.add_features(1, {'keypoints': np.array([[1, 2], [3, 4], [5, 6], [7, 8]])}))
+        self.assertTrue(self.landmark_tracker.add_features(2, {'keypoints': np.array([[1, 2], [3, 4], [5, 6], [7, 8]])}))
+
         self.landmark_tracker.add_matches(0, 1, np.array([[0, 1], [1, 2], [2, 3]]))
         self.assertEqual(len(self.landmark_tracker.feature_to_landmark_id), 2)
         self.assertEqual(len(self.landmark_tracker.feature_to_landmark_id[0]), 3)
@@ -151,6 +187,12 @@ class TestMathFunctions(unittest.TestCase):
         self.landmark_tracker.assigned_points_3d_if_not_values(0, 0, np.array([0, 1, 2]))
         self.landmark_tracker.assigned_points_3d_if_not_values(0, 1, np.array([1, 2, 3]))
         self.landmark_tracker.assigned_points_3d_if_not_values(0, 2, np.array([2, 3, 4]))
+
+        timestamp_to_camera_index = {0: 0, 1: 1, 2: 2}
+        projection_relations, landmark_positions, landmark_id_to_index = self.landmark_tracker.get_projection_relations_and_landmark_position(timestamp_to_camera_index)
+        self.assertEqual(len(projection_relations), 6)
+        self.assertEqual(len(landmark_positions), 3)
+        self.assertEqual(len(landmark_id_to_index), 3)
 
 if __name__ == '__main__':
     unittest.main()
