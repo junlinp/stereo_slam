@@ -37,7 +37,7 @@ def quaternion_rotation_vector(q: np.ndarray, p:np.ndarray) -> np.ndarray:
 class Rigid3d:
     # qx, qy, qz, qw
     # x, y, z
-    def __init__(self, rotation_quaternion, translation):
+    def __init__(self, rotation_quaternion: np.ndarray, translation: np.ndarray):
         self.rotation_quaternion = rotation_quaternion
         self.translation = translation
 
@@ -60,6 +60,12 @@ class Rigid3d:
     def translation_vector(self) -> np.ndarray:
         return self.translation
 
+    def matrix44(self) -> np.ndarray:
+        res = np.eye(4)
+        res[:3, :3] = self.to_matrix33()
+        res[:3, 3] = self.translation
+        return res
+
     @staticmethod
     def from_vector(vector: np.ndarray) -> 'Rigid3d':
         translation = vector[:3]
@@ -69,5 +75,10 @@ class Rigid3d:
     @staticmethod
     def identity() -> 'Rigid3d':
         return Rigid3d(np.array([0, 0, 0, 1]), np.array([0, 0, 0]))
-        
+
+    @staticmethod
+    def from_matrix(matrix: np.ndarray) -> 'Rigid3d':
+        translation = matrix[:3, 3]
+        rotation_quaternion = R.from_matrix(matrix[:3, :3]).as_quat()
+        return Rigid3d(rotation_quaternion, translation)
         

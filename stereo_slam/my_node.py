@@ -11,9 +11,6 @@ import numpy as np
 import cv2
 import torch
 #import matplotlib.pyplot as plt
-from transformers import AutoImageProcessor, AutoModel
-from lightglue import LightGlue, SuperPoint, DISK, SIFT, ALIKED, DoGHardNet
-from lightglue.utils import load_image, rbd
 from codetiming import Timer
 from scipy.spatial.transform import Rotation as R
 import einops
@@ -24,19 +21,9 @@ from .rigid3d import Rigid3d
 logger = None
 
 # SuperPoint+LightGlue
-extractor = SuperPoint(max_num_keypoints=2048).eval().cuda()  # load the extractor
-matcher = LightGlue(features='superpoint').eval().cuda()  # load the matcher
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
-model = AutoModel.from_pretrained("facebook/dinov2-base").to(device).eval()
 
-def get_embeddings(image):
-    image = processor(image, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = model(**image)
-        embeddings = outputs.last_hidden_state[:, 0, :]
-    return embeddings.cpu().squeeze(0)
 
 def create_pointcloud2(points: np.ndarray, frame_id="map") -> PointCloud2:
     """Creates a PointCloud2 message from a Nx3 numpy array."""
@@ -68,46 +55,12 @@ def create_pointcloud2(points: np.ndarray, frame_id="map") -> PointCloud2:
     )
     return cloud_msg
 
-# === Helper: Convert OpenCV to PIL ===
-def cv2_to_tensor(img):
-    img = einops.rearrange(img, 'h w c -> c h w')
-    return torch.tensor(img / 255.0, dtype=torch.float).unsqueeze(0).cuda()
 
-def extract_keypoints(image):
-    feats = extractor.extract(cv2_to_tensor(image))
-    return feats
 
-def match_keypoints(feats0, feats1):
-    # match the features
-    with Timer(text="[lightglue] Elapsed time: {milliseconds:.0f} ms"):
-        matches01 = matcher({'image0': feats0, 'image1': feats1})
-    #print(f"matches01: {matches01}")
-    #print(f"before feats0: {feats0['keypoints'].shape}")
-    #print(f"before feats1: {feats1['keypoints'].shape}")
-    feats0, feats1, matches01 = [rbd(x) for x in [feats0, feats1, matches01]]  # remove batch dimension
-    matches = matches01['matches']  # indices with shape (K,2)
-    #print(f"feats0: {feats0['keypoints'].shape}")
-    #print(f"feats1: {feats1['keypoints'].shape}")
-    #print(f"matches: {matches}")
-    return matches
 
-def compute_disparity_sgbm(left_img, right_img):
-    matcher = cv2.StereoSGBM_create(
-    minDisparity=0,
-    numDisparities=128,
-    blockSize=5,
-    P1=8 * 3 * 5**2,
-    P2=32 * 3 * 5**2,
-    disp12MaxDiff=1,
-    uniquenessRatio=10,
-    speckleWindowSize=100,
-    speckleRange=2,
-    preFilterCap=63,
-    mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY
-    )
-    disparity = matcher.compute(left_img, right_img).astype(np.float32) / 16
-    disparity[disparity < 0] = 0 # mask invalid disparities
-    return disparity
+
+
+
 
 
 def stereo_rectify(cam0_image, cam1_image, cam0_intrinsics, cam1_intrinsics, cam0_distortion, cam1_distortion,cam0_extrinsics, cam1_extrinsics):
