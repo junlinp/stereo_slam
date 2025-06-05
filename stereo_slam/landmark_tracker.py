@@ -143,6 +143,24 @@ class LandmarkTracker:
         for landmark_id, index in landmark_id_to_index.items():
             self.landmark_id_to_position[landmark_id] = landmark_positions[index]
 
+    def get_statistics(self) -> list:
+        tracker_statistics = {}
+
+        for landmark_id in self.landmark_id_to_position.keys():
+            if landmark_id not in self.landmark_id_to_feature_index:
+                print(f"landmark_id {landmark_id} not in landmark_id_to_feature_index")
+                continue
+
+            feature_index = self.landmark_id_to_feature_index[landmark_id]
+
+            tracker_length = len(feature_index)
+
+            if tracker_length not in tracker_statistics:
+                tracker_statistics[tracker_length] = 0
+            tracker_statistics[tracker_length] += 1
+        return tracker_statistics
+
+
 import unittest 
 class TestMathFunctions(unittest.TestCase):
 

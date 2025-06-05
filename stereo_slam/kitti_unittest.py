@@ -465,6 +465,88 @@ class KittiUnitTest(unittest.TestCase):
         plt.savefig(f"kitti_simularity_{self.kitti_data.seq_id}.png")
         plt.close()
 
+    def test_kitti_tracker_statistics(self):
+        FRAME_STEP = 10
+        NUM_FRAMES = len(self.kitti_data.load_kitti_poses())
+
+        K, baseline = self.kitti_data.load_intrinsics()
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+
+        poses = { 0 : np.eye(4) }
+
+        landmark_tracker = LandmarkTracker()
+        bundle_adjustment = BundleAdjustment()
+        bundle_adjustment.update_camera_intrinsics(K)
+
+        for i in tqdm(range(FRAME_STEP, NUM_FRAMES, FRAME_STEP), desc="Processing frames"):
+            prev_left_img = self.kitti_data.load_gray_image(i - FRAME_STEP, left=True)
+            prev_right_img = self.kitti_data.load_gray_image(i - FRAME_STEP, left=False)
+            curr_left_img = self.kitti_data.load_gray_image(i, left=True)
+            curr_right_img = self.kitti_data.load_gray_image(i, left=False)
+
+            curr_disparity_map = compute_disparity_sgbm(curr_left_img, curr_right_img)
+            kets_curr = extract_keypoints(curr_left_img)
+            kets_prev = extract_keypoints(prev_left_img)
+
+            landmark_tracker.add_features(i, kets_curr)
+            landmark_tracker.add_features(i - FRAME_STEP, kets_prev)
+
+            matches, matches_kpts_prev, matches_kpts_curr = match_keypoints(kets_prev, kets_curr)
+            landmark_tracker.add_matches(i - FRAME_STEP, i, matches)
+
+            points_3d = []
+            points_2d = []
+            feature_index = []
+            for pt_prev, pt_curr, match_indexs in zip(matches_kpts_prev, matches_kpts_curr, matches):
+                u, v = int(pt_curr[0]), int(pt_curr[1])
+                if 0 <= v < curr_disparity_map.shape[0] and 0 <= u < curr_disparity_map.shape[1]:
+                    disp = curr_disparity_map[v, u]
+                    if disp > 1:
+                        Z = fx * baseline / disp
+                        X = (pt_curr[0] - cx) * Z / fx  
+                        Y = (pt_curr[1] - cy) * Z / fy
+                        points_3d.append([X, Y, Z])
+                        points_2d.append(pt_prev)
+                        feature_index.append(match_indexs[1])
+
+            points_3d = np.array(points_3d, dtype=np.float32)
+            points_2d = np.array(points_2d, dtype=np.float32)
+
+            success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                points_3d, points_2d,
+                cameraMatrix=K,
+                distCoeffs=None,
+                flags=cv2.SOLVEPNP_ITERATIVE
+            )
+
+
+            if not success:
+                print(f"Frame {i}: PnP failed")
+                poses[i] = poses[i - FRAME_STEP]
+                continue
+
+            R, _ = cv2.Rodrigues(rvec)
+            T = np.eye(4)
+            T[:3, :3] = R
+            T[:3, 3] = tvec.ravel()
+            poses[i] = poses[i - FRAME_STEP] @ np.linalg.inv(T)
+            current_pose = poses[i]
+            current_pose = Rigid3d.from_matrix(current_pose)
+            world_points = current_pose.to_matrix33() @ points_3d.T + current_pose.translation.reshape(-1, 1)
+            for index, feature_index in enumerate(feature_index):
+                landmark_tracker.assigned_points_3d_if_not_values(i, feature_index, world_points[:, index])
+
+        landmark_tracker_statistics = landmark_tracker.get_statistics()
+
+        # draw the statistics
+        plt.figure(figsize=(8, 6))
+        plt.plot(landmark_tracker_statistics.keys(), landmark_tracker_statistics.values())
+        plt.xlabel('track_length')
+        plt.ylabel('number_of_track')
+        plt.title(f'Landmark Tracker Statistics (KITTI seq {self.kitti_data.seq_id})')
+        plt.savefig(f"kitti_tracker_statistics_{self.kitti_data.seq_id}.png")
+        plt.close()
+
     def test_kitti_test_pose_bundle_adjustment(self):
         FRAME_STEP = 10
         NUM_FRAMES = len(self.kitti_data.load_kitti_poses())
