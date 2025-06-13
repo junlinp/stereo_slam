@@ -1,0 +1,13 @@
+*.png
+**/build
+NVIDIA-*
+*.ply
+**/*.so
+**/*.csv
+**/tmp
+*.egg-info
+V1_01_easy
+*.zip
+**/*.bt
+rosbag*
+*.egg

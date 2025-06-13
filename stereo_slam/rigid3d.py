@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+import pypose as pp
 
 def quaternion_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     x1 = q1[0]
@@ -44,6 +45,9 @@ class Rigid3d:
     def __mul__(self, other):
         return Rigid3d(quaternion_multiply(self.rotation_quaternion, other.rotation_quaternion), self.translation + quaternion_rotation_vector(self.rotation_quaternion, other.translation))
 
+    def __matmul__(self, other):
+        return self * other
+
     def transform(self, p: np.ndarray) -> np.ndarray:
         return quaternion_rotation_vector(self.rotation_quaternion, p) + self.translation
 
@@ -66,6 +70,14 @@ class Rigid3d:
         res[:3, 3] = self.translation
         return res
 
+    def rotation_difference(self, other: 'Rigid3d') -> np.ndarray:
+        quaternion_diff = quaternion_multiply(quaternion_inverse(self.rotation_quaternion), other.rotation_quaternion)
+        w = quaternion_diff[3]
+        return np.arccos(np.clip(w, -1, 1)) * 2.0
+
+    def translation_difference(self, other: 'Rigid3d') -> np.ndarray:
+        return np.linalg.norm(self.translation - other.translation)
+
     @staticmethod
     def from_vector(vector: np.ndarray) -> 'Rigid3d':
         translation = vector[:3]
@@ -81,4 +93,7 @@ class Rigid3d:
         translation = matrix[:3, 3]
         rotation_quaternion = R.from_matrix(matrix[:3, :3]).as_quat()
         return Rigid3d(rotation_quaternion, translation)
+
+    def to_se3(self) -> pp.SE3:
+        return pp.SE3(self.to_vector())
         

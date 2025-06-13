@@ -1,9 +1,10 @@
-from transformers import AutoImageProcessor, AutoModel
+from transformers import AutoImageProcessor, AutoModel, SegformerForSemanticSegmentation
 from lightglue import LightGlue, SuperPoint, DISK, SIFT, ALIKED, DoGHardNet
 from lightglue.utils import load_image, rbd
 import cv2
 import torch
 import einops
+import numpy as np
 
 matcher = LightGlue(features='superpoint').eval().cuda()  # load the matcher
 
@@ -46,6 +47,19 @@ def get_embeddings(image):
     with torch.no_grad():
         outputs = model(**image)
         embeddings = outputs.last_hidden_state[:, 0, :]
-    return embeddings.cpu().squeeze(0)
+    # (1, 768)
+    return embeddings.cpu().numpy()
 
 
+def segment_sky_mask(gray_image:np.ndarray):
+    model = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
+    processor = AutoImageProcessor.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
+    img = cv2.cvtColor(gray_image, cv2.COLOR_GRAY2BGR)
+    inputs = processor(img, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(**inputs)
+    predicted_segmentation_map = processor.post_process_semantic_segmentation(outputs, target_sizes=[img.shape[0:2]])[0]
+    predicted_segmentation_map = predicted_segmentation_map.cpu().numpy()
+    # print(f"predicted_segmentation_map: {predicted_segmentation_map}")
+    # 2 is sky, other is not sky
+    return predicted_segmentation_map == 2

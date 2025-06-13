@@ -107,8 +107,9 @@ def project_point(K, q, t, point3D):
     """Projects a 3D point into a camera using K, quaternion q, and translation t."""
     R = quat2mat(q / np.linalg.norm(q))
     p_cam = R.T @ (point3D - t)
-    proj = K @ p_cam
-    return proj[:2] / proj[2]
+    p_cam_normalized = p_cam / p_cam[2]
+    proj = K @ p_cam_normalized
+    return proj[:2]
 
 class TestBundleAdjustment(unittest.TestCase):
     def test_project(self):
@@ -163,7 +164,7 @@ class TestBundleAdjustment(unittest.TestCase):
         bundle_adjustment = BundleAdjustment()
         bundle_adjustment.update_camera_intrinsics(K)
 
-        camera_poses_estimated, landmark_positions_estimated = bundle_adjustment.optimize(pose, landmark_positions, projection_relations, max_iterations=1024, lr=0.001)
+        camera_poses_estimated, landmark_positions_estimated = bundle_adjustment.optimize(pose, landmark_positions, projection_relations, max_iterations=128, lr=0.001)
 
 
         camera_poses_estimated = [Rigid3d(translation=camera_poses_estimated[i, 0:3], rotation_quaternion=camera_poses_estimated[i, 3:7]) for i in range(camera_poses_estimated.shape[0])]

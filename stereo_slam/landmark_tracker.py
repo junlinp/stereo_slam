@@ -11,6 +11,7 @@ class LandmarkTracker:
         self.feature_to_landmark_id = {}
         self.landmark_id_to_feature_index = {}
         self.landmark_id_to_position = {}
+        self.global_embeddings = {}
 
     def add_features(self, timestamp: int, feature:dict) -> bool:
         if timestamp in self.feature_buffer:
@@ -22,6 +23,26 @@ class LandmarkTracker:
 
     def get_features(self, timestamp: int):
         return self.feature_buffer[timestamp]
+
+    def add_global_embeddings(self, timestamp: int, embeddings: np.ndarray):
+        # normalize the embeddings
+        # shape: (1, 768)
+        embeddings = embeddings / np.linalg.norm(embeddings)
+        self.global_embeddings[timestamp] = embeddings
+
+    def find_top_similar_embeddings(self, query_timestamp: int, embeddings: np.ndarray) -> int:
+        # normalize the embeddings
+        embeddings = embeddings / np.linalg.norm(embeddings)
+        index_to_timestamp = {index: timestamp for index, timestamp in enumerate(self.global_embeddings.keys()) if timestamp != query_timestamp}
+        # both embeddings are normalized, so the dot product is the cosine similarity
+
+        # shape: (N, 768)
+        global_embeddings = np.array([value for key, value in self.global_embeddings.items() if key != query_timestamp])
+        if global_embeddings.shape[0] == 0:
+            return -1
+        similarities = global_embeddings @ embeddings.T
+        max_index = np.argmax(similarities)
+        return index_to_timestamp[max_index]
 
     def get_keypoint_2d(self, timestamp: int, feature_index: int):
         return self.feature_buffer[timestamp]['keypoints'][feature_index]
@@ -115,7 +136,7 @@ class LandmarkTracker:
     def get_landmark_positions(self) -> np.ndarray:
         return np.array([self.landmark_id_to_position[landmark_id] for landmark_id in self.landmark_id_to_position])
     
-    def get_projection_relations_and_landmark_position(self, timestamp_to_camera_index: dict) -> list:
+    def get_projection_relations_and_landmark_position(self, timestamp_to_camera_index: dict, track_min_length: int = 3) -> list:
         landmark_id_to_index = {}
 
         for index, landmark_id in enumerate(self.landmark_id_to_position.keys()):
@@ -128,6 +149,9 @@ class LandmarkTracker:
             landmark_positions[position_index, :] = self.landmark_id_to_position[landmark_id]
 
             landmark_index_to_timestamp = self.landmark_id_to_feature_index[landmark_id]
+            track_length = len(landmark_index_to_timestamp)
+            if track_length < track_min_length:
+                continue
 
             for timestamp, feature_index in landmark_index_to_timestamp.items():
                 if timestamp not in timestamp_to_camera_index:
