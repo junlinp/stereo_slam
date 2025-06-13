@@ -1,7 +1,14 @@
+from pybind11.setup_helpers import Pybind11Extension, build_ext
 from setuptools import setup
 
 package_name = 'stereo_slam'
 
+ext_modules = [
+    Pybind11Extension(
+        'stereo_slam_pybind',
+        ['stereo_slam/stereo_slam_pybind/stereo_slam_pybind.cc'],
+    )
+]
 setup(
     name=package_name,
     version='0.0.1',
@@ -11,6 +18,7 @@ setup(
          ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
     ],
+    ext_modules=ext_modules,
     install_requires=['setuptools', 'opencv-python', 'numpy', 'scipy', 'pyyaml', 'tqdm'],
     zip_safe=True,
     maintainer='junlinp',

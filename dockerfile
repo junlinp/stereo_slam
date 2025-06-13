@@ -21,6 +21,8 @@ RUN cd LightGlue && pip3 install .
 # create a workspace
 RUN mkdir -p /home/ros/ros2_ws/src
 
+RUN git clone https://github.com/pybind/pybind11.git
+RUN mkdir -p pybind11/build && cd pybind11/build && cmake .. && make -j4 && make install
 
 SHELL ["/bin/bash", "-c"]
 RUN echo "source /opt/ros/foxy/setup.bash" >> ~/.bashrc
